@@ -1,0 +1,6 @@
+# GeminiAnalyzer — no external dependencies required for core functionality.
+# Python 3.10+ with tkinter (included in standard installs).
+#
+# Optional enhancements:
+# ttkbootstrap>=1.10     # Modern themed widgets (optional)
+# Pillow>=10.0           # Image handling for future features (optional)
