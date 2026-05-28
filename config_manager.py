@@ -10,7 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 APP_NAME = "GeminiAnalyzer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 
 def get_config_dir() -> Path:
@@ -61,6 +61,18 @@ DEFAULT_CONFIG = {
     "auto_save_state": True,
     "code_wrap_lines": False,
     "show_line_numbers": True,
+    # ── LLM (OpenRouter) ──
+    "llm_enabled": True,
+    "llm_provider": "openrouter",
+    "llm_model": "deepseek/deepseek-v4-flash:free",
+    "llm_fallback_models": [
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+    ],
+    "llm_temperature": 0.2,
+    "llm_max_tokens": 1024,
+    "llm_timeout": 60,
+    "llm_cache_enabled": True,
 }
 
 

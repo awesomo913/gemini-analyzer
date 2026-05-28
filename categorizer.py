@@ -180,6 +180,89 @@ CATEGORIES = {
             "Lifestyle": ["recipe", "travel", "hobby", "home", "garden"],
         },
     },
+    "Writing & Editing": {
+        "keywords": {
+            "proofread", "rephrase", "rewrite", "paraphrase", "summarize", "summary",
+            "grammar", "spelling", "edit", "editing", "tone", "concise", "wording",
+            "translate", "translation", "shorten", "expand this", "make it sound",
+            "fix the grammar", "improve this text", "reword",
+        },
+        "subcategories": {
+            "Proofreading & Grammar": ["proofread", "grammar", "spelling", "punctuation"],
+            "Summarizing": ["summarize", "summary", "tldr", "key points", "condense"],
+            "Rewriting & Tone": ["rephrase", "rewrite", "reword", "tone", "make it sound"],
+            "Translation": ["translate", "translation", "in spanish", "in french", "language"],
+        },
+    },
+    "Productivity & Planning": {
+        "keywords": {
+            "todo", "to-do", "task list", "checklist", "plan my", "schedule",
+            "organize", "organization", "prioritize", "goal", "goals", "habit",
+            "routine", "time management", "productivity", "note-taking", "notes",
+            "agenda", "reminder", "workflow", "system for",
+        },
+        "subcategories": {
+            "Task & To-Do": ["todo", "to-do", "task list", "checklist", "prioritize"],
+            "Scheduling": ["schedule", "calendar", "agenda", "time management", "routine"],
+            "Goals & Habits": ["goal", "goals", "habit", "milestone", "track progress"],
+            "Notes & Knowledge": ["notes", "note-taking", "organize", "knowledge base"],
+        },
+    },
+    "Finance & Money": {
+        "keywords": {
+            "budget", "budgeting", "invest", "investing", "investment", "stock",
+            "stocks", "crypto", "bitcoin", "ethereum", "tax", "taxes", "savings",
+            "loan", "mortgage", "interest rate", "retirement", "401k", "income",
+            "expense", "debt", "salary", "pricing", "revenue", "profit margin",
+        },
+        "subcategories": {
+            "Budgeting & Saving": ["budget", "budgeting", "savings", "expense", "debt"],
+            "Investing": ["invest", "investing", "stock", "crypto", "retirement", "401k"],
+            "Taxes": ["tax", "taxes", "deduction", "irs", "write-off"],
+            "Business Finance": ["revenue", "profit margin", "pricing", "cash flow"],
+        },
+    },
+    "Media & Design": {
+        "keywords": {
+            "image", "logo", "photo", "picture", "video", "design", "graphic",
+            "canvas", "ui design", "ux", "color palette", "color scheme", "font",
+            "typography", "mockup", "wireframe", "illustration", "icon", "banner",
+            "thumbnail", "edit photo", "generate an image", "draw",
+        },
+        "subcategories": {
+            "Image Generation": ["generate an image", "image", "draw", "illustration", "picture"],
+            "Graphic Design": ["logo", "graphic", "banner", "thumbnail", "icon"],
+            "UI/UX Design": ["ui design", "ux", "wireframe", "mockup", "color palette"],
+            "Video & Audio": ["video", "edit video", "audio", "soundtrack", "podcast"],
+        },
+    },
+    "Hardware & Electronics": {
+        "keywords": {
+            "raspberry pi", "arduino", "esp32", "esp8266", "gpio", "circuit",
+            "sensor", "microcontroller", "soldering", "breadboard", "voltage",
+            "resistor", "led", "servo", "motor", "3d print", "3d printing",
+            "firmware", "embedded", "iot", "wiring", "pinout",
+        },
+        "subcategories": {
+            "Raspberry Pi": ["raspberry pi", "gpio", "pi zero", "pi 4", "pi 5"],
+            "Arduino & Microcontrollers": ["arduino", "esp32", "esp8266", "microcontroller", "firmware"],
+            "Circuits & Components": ["circuit", "resistor", "voltage", "breadboard", "soldering"],
+            "3D Printing": ["3d print", "3d printing", "slicer", "filament", "stl"],
+        },
+    },
+    "Gaming": {
+        "keywords": {
+            "game", "gameplay", "rpg", "strategy game", "minecraft", "pokemon",
+            "speedrun", "walkthrough", "boss fight", "level up", "quest",
+            "video game", "console", "nintendo", "playstation", "xbox", "steam",
+            "character build", "loadout", "achievement", "cheat code",
+        },
+        "subcategories": {
+            "Gameplay & Strategy": ["gameplay", "strategy game", "boss fight", "walkthrough", "quest"],
+            "Specific Games": ["minecraft", "pokemon", "steam", "nintendo", "playstation"],
+            "Builds & Optimization": ["character build", "loadout", "level up", "achievement"],
+        },
+    },
 }
 
 

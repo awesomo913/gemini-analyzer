@@ -13,6 +13,14 @@ from parser import Conversation, parse_input
 from categorizer import categorize_all
 from config_manager import Config, APP_NAME, APP_VERSION
 from diagnostics import generate_report
+from reconstruct import ProjectThread, reconstruct_projects, build_timeline
+from insights import (
+    default_client_from_config, summarize_project, review_project,
+    ProjectSummary, ProjectReview,
+)
+from export import write_project_bundle, write_dedup_report
+from llm_client import is_available as llm_is_available, ENV_KEY as LLM_ENV_KEY
+from llm_cache import LLMCache
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +179,15 @@ class GeminiAnalyzerApp:
         self.filtered_conversations: list[Conversation] = []
         self.selected_conversation: Optional[Conversation] = None
 
+        # Phase 2-4 backend integration
+        self._project_threads: list[ProjectThread] = []
+        self._thread_by_iid: dict[str, ProjectThread] = {}
+        self.selected_thread: Optional[ProjectThread] = None
+        self._project_summaries: dict[str, ProjectSummary] = {}  # keyed by thread.name
+        self._project_reviews: dict[str, ProjectReview] = {}
+        self.llm_client = default_client_from_config(self.config)
+        self.llm_cache = LLMCache(enabled=self.config.get("llm_cache_enabled", True))
+
         self._build_menu()
         self._build_ui()
         self._bind_keys()
@@ -217,6 +234,9 @@ class GeminiAnalyzerApp:
                             fg=self.colors["fg"], activebackground=self.colors["accent"],
                             activeforeground="#ffffff")
         tools_menu.add_command(label="Run Diagnostics     F12", command=self._run_diagnostics)
+        tools_menu.add_command(label="Find Duplicates → save report…",
+                               command=self._save_dedup_report)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Reset Settings", command=self._reset_settings)
         menubar.add_cascade(label="Tools", menu=tools_menu)
 
@@ -376,7 +396,12 @@ class GeminiAnalyzerApp:
         self.notebook.add(projects_tab, text="  \u2692 Projects & Apps  ")
         self._build_projects_tab(projects_tab)
 
-        # Tab 4: Overview / Dashboard
+        # Tab 4: Timeline
+        timeline_tab = ttk.Frame(self.notebook)
+        self.notebook.add(timeline_tab, text="  \u29d7 Timeline  ")
+        self._build_timeline_tab(timeline_tab)
+
+        # Tab 5: Overview / Dashboard
         overview_tab = ttk.Frame(self.notebook)
         self.notebook.add(overview_tab, text="  \u2637 Overview  ")
         self._build_overview_tab(overview_tab)
@@ -602,15 +627,17 @@ class GeminiAnalyzerApp:
         proj_actions = ttk.Frame(parent)
         proj_actions.pack(fill="x", padx=8, pady=(0, 4))
 
-        ttk.Button(proj_actions, text="Export Selected Projects...",
-                   command=self._export_selected_projects,
-                   style="Accent.TButton").pack(side="left", padx=(0, 6))
-        ttk.Button(proj_actions, text="Export All Projects...",
+        ttk.Button(proj_actions, text="Export Selected (code only)",
+                   command=self._export_selected_projects).pack(side="left", padx=(0, 6))
+        ttk.Button(proj_actions, text="Export All (code only)",
                    command=self._export_all_projects).pack(side="left", padx=(0, 6))
         ttk.Button(proj_actions, text="Copy Selected Code",
                    command=self._copy_selected_project_code).pack(side="left", padx=(0, 6))
+        ttk.Button(proj_actions, text="Export Claude-ready Bundles…",
+                   command=self._export_claude_bundles_selected,
+                   style="Accent.TButton").pack(side="left", padx=(12, 6))
 
-        ttk.Label(proj_actions, text="Shift+click or Ctrl+click to select multiple",
+        ttk.Label(proj_actions, text="Shift/Ctrl+click for multi-select",
                   style="Dim.TLabel").pack(side="right")
 
         paned = ttk.PanedWindow(parent, orient="horizontal")
@@ -622,16 +649,20 @@ class GeminiAnalyzerApp:
 
         self.proj_tree = ttk.Treeview(
             proj_list_frame,
-            columns=("convs", "blocks", "langs"),
+            columns=("name", "convs", "span", "blocks", "langs"),
             show="headings",
             selectmode="extended",
         )
-        self.proj_tree.heading("convs", text="Conversations")
-        self.proj_tree.heading("blocks", text="Code Blocks")
+        self.proj_tree.heading("name", text="Project")
+        self.proj_tree.heading("convs", text="Convs")
+        self.proj_tree.heading("span", text="Span")
+        self.proj_tree.heading("blocks", text="Code")
         self.proj_tree.heading("langs", text="Languages")
-        self.proj_tree.column("convs", width=90, anchor="center")
-        self.proj_tree.column("blocks", width=80, anchor="center")
-        self.proj_tree.column("langs", width=160)
+        self.proj_tree.column("name", width=240, minwidth=120)
+        self.proj_tree.column("convs", width=60, anchor="center")
+        self.proj_tree.column("span", width=70, anchor="center")
+        self.proj_tree.column("blocks", width=60, anchor="center")
+        self.proj_tree.column("langs", width=180)
 
         proj_scroll = ttk.Scrollbar(proj_list_frame, orient="vertical",
                                      command=self.proj_tree.yview)
@@ -644,8 +675,26 @@ class GeminiAnalyzerApp:
         detail_frame = ttk.Frame(paned)
         paned.add(detail_frame, weight=2)
 
+        # Per-project LLM/bundle action bar (sits above the detail Text widget)
+        detail_actions = ttk.Frame(detail_frame)
+        detail_actions.pack(fill="x", padx=4, pady=(4, 0))
+        self.proj_llm_status = tk.StringVar(
+            value=("LLM ready" if llm_is_available() else f"LLM idle — set {LLM_ENV_KEY} to enable")
+        )
+        ttk.Button(detail_actions, text="Summarize (LLM)",
+                   command=self._llm_summarize_selected_project).pack(side="left", padx=(0, 4))
+        ttk.Button(detail_actions, text="Deep Review (LLM)",
+                   command=self._llm_review_selected_project).pack(side="left", padx=(0, 4))
+        ttk.Button(detail_actions, text="Export Claude Bundle…",
+                   command=self._export_claude_bundle_single).pack(side="left", padx=(0, 4))
+        ttk.Label(detail_actions, textvariable=self.proj_llm_status,
+                  style="Dim.TLabel").pack(side="right")
+
+        text_frame = ttk.Frame(detail_frame)
+        text_frame.pack(fill="both", expand=True)
+
         self.proj_detail = tk.Text(
-            detail_frame,
+            text_frame,
             wrap="word",
             bg=self.colors["bg_secondary"],
             fg=self.colors["fg"],
@@ -655,7 +704,7 @@ class GeminiAnalyzerApp:
             padx=12,
             pady=8,
         )
-        proj_detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical",
+        proj_detail_scroll = ttk.Scrollbar(text_frame, orient="vertical",
                                             command=self.proj_detail.yview)
         self.proj_detail.configure(yscrollcommand=proj_detail_scroll.set)
         self.proj_detail.pack(side="left", fill="both", expand=True)
@@ -675,6 +724,74 @@ class GeminiAnalyzerApp:
         self.proj_detail.configure(state="disabled")
 
         self._project_data: dict = {}
+
+    def _build_timeline_tab(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=8, pady=8)
+        ttk.Label(top, text="Activity over time",
+                  style="Heading.TLabel").pack(side="left")
+
+        ttk.Label(top, text="Bucket:").pack(side="left", padx=(20, 4))
+        self.timeline_period = tk.StringVar(value="month")
+        period_combo = ttk.Combobox(
+            top, textvariable=self.timeline_period,
+            values=["day", "month", "year"], state="readonly", width=8,
+        )
+        period_combo.pack(side="left")
+        period_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_timeline())
+
+        self.timeline_summary_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.timeline_summary_var,
+                  style="Dim.TLabel").pack(side="right")
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self.timeline_tree = ttk.Treeview(
+            tree_frame,
+            columns=("period", "total", "bar", "top_categories"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.timeline_tree.heading("period", text="Period")
+        self.timeline_tree.heading("total", text="Conversations")
+        self.timeline_tree.heading("bar", text="")
+        self.timeline_tree.heading("top_categories", text="Top categories")
+        self.timeline_tree.column("period", width=110, minwidth=80)
+        self.timeline_tree.column("total", width=110, minwidth=80, anchor="center")
+        self.timeline_tree.column("bar", width=200, minwidth=100)
+        self.timeline_tree.column("top_categories", width=500, minwidth=200)
+
+        tl_scroll = ttk.Scrollbar(tree_frame, orient="vertical",
+                                   command=self.timeline_tree.yview)
+        self.timeline_tree.configure(yscrollcommand=tl_scroll.set)
+        self.timeline_tree.pack(side="left", fill="both", expand=True)
+        tl_scroll.pack(side="right", fill="y")
+
+    def _rebuild_timeline(self) -> None:
+        if not hasattr(self, "timeline_tree"):
+            return
+        self.timeline_tree.delete(*self.timeline_tree.get_children())
+        if not self.conversations:
+            self.timeline_summary_var.set("")
+            return
+        period = self.timeline_period.get() if hasattr(self, "timeline_period") else "month"
+        buckets = build_timeline(self.conversations, period=period)
+        max_total = max((b["total"] for b in buckets), default=1)
+        peak = max(buckets, key=lambda b: b["total"]) if buckets else None
+
+        for b in buckets:
+            bar_len = int((b["total"] / max_total) * 40) if max_total else 0
+            bar = "█" * bar_len + "░" * (40 - bar_len)
+            top_cats = ", ".join(
+                f"{c} ({n})" for c, n in list(b.get("by_category", {}).items())[:4]
+            )
+            self.timeline_tree.insert("", "end",
+                                       values=(b["period"], b["total"], bar, top_cats))
+        if peak:
+            self.timeline_summary_var.set(
+                f"{len(buckets)} buckets · peak {peak['period']} = {peak['total']:,} conversations"
+            )
 
     def _build_overview_tab(self, parent: ttk.Frame) -> None:
         self.overview_text = tk.Text(
@@ -813,6 +930,7 @@ class GeminiAnalyzerApp:
         self._rebuild_conversation_list()
         self._rebuild_code_blocks()
         self._rebuild_projects()
+        self._rebuild_timeline()
         self._rebuild_overview()
         self._update_stats()
 
@@ -938,54 +1056,52 @@ class GeminiAnalyzerApp:
         self.code_count_var.set(f"{len(self._visible_code_blocks)} blocks")
 
     def _rebuild_projects(self) -> None:
+        """Use union-find reconstruction to stitch fragmented activity entries
+        into multi-conversation project threads (Phase 2 backend)."""
         self._project_data = {}
+        self._thread_by_iid = {}
+        self._pdata_key_by_iid: dict[str, str] = {}
 
-        coding_convs = [c for c in self.conversations
-                        if c.category == "Coding & Programming"]
-
-        app_creation_convs = [c for c in coding_convs
-                              if any("app-creation" in t for t in c.tags)]
-
-        named_projects: dict[str, list[Conversation]] = {}
-        unnamed_app_convs: list[Conversation] = []
-
-        for conv in coding_convs:
-            if conv.coding_project_name:
-                key = conv.coding_project_name
-                if key not in named_projects:
-                    named_projects[key] = []
-                named_projects[key].append(conv)
-            elif conv in app_creation_convs:
-                unnamed_app_convs.append(conv)
-
-        for conv in unnamed_app_convs:
-            title_key = conv.title[:40].strip()
-            if title_key:
-                if title_key not in named_projects:
-                    named_projects[title_key] = []
-                named_projects[title_key].append(conv)
-
-        self._project_data = named_projects
+        try:
+            self._project_threads = reconstruct_projects(self.conversations, min_size=2)
+        except Exception as e:
+            logger.error("Project reconstruction failed: %s", e, exc_info=True)
+            self._project_threads = []
 
         self.proj_tree.delete(*self.proj_tree.get_children())
-        for name in sorted(named_projects.keys()):
-            convs = named_projects[name]
-            all_blocks = []
-            all_langs = set()
-            for c in convs:
-                blocks = c.all_code_blocks
-                all_blocks.extend(blocks)
-                for b in blocks:
-                    all_langs.add(b["language"])
+        seen_keys: dict[str, int] = {}
+        for i, t in enumerate(self._project_threads):
+            iid = f"t{i}"
+            self._thread_by_iid[iid] = t
 
-            self.proj_tree.insert("", "end", text=name, iid=name,
-                                   values=(len(convs), len(all_blocks),
-                                           ", ".join(sorted(all_langs))))
+            # Back-compat: _project_data[display_name] -> list[Conversation],
+            # used by the existing code-only export/copy paths. Disambiguate
+            # duplicate names. We also remember iid -> key so selection lookups
+            # don't return raw iids and silently miss the dict.
+            key = t.name or f"Project {i}"
+            if key in seen_keys:
+                seen_keys[key] += 1
+                key = f"{key} ({seen_keys[key]})"
+            else:
+                seen_keys[key] = 1
+            self._project_data[key] = t.conversations
+            self._pdata_key_by_iid[iid] = key
 
-        total = len(named_projects)
+            span = f"{t.span_days}d" if t.span_days is not None else "?"
+            langs = ", ".join(t.languages) if t.languages else ""
+            self.proj_tree.insert(
+                "", "end", iid=iid,
+                values=(t.name[:60], t.size, span, t.code_block_count, langs),
+            )
+
+        coding_count = sum(
+            1 for c in self.conversations
+            if c.category == "Coding & Programming" or c.coding_project_name
+        )
+        total = len(self._project_threads)
         self.project_count_var.set(
-            f"{total} project{'s' if total != 1 else ''} | "
-            f"{len(coding_convs)} coding conversations"
+            f"{total} reconstructed project{'s' if total != 1 else ''} "
+            f"(from {coding_count} coding conversations)"
         )
 
     def _rebuild_overview(self) -> None:
@@ -1147,9 +1263,11 @@ class GeminiAnalyzerApp:
         selection = self.proj_tree.selection()
         if not selection:
             return
-        name = selection[0]
-        if name in self._project_data:
-            self._display_project(name, self._project_data[name])
+        iid = selection[0]
+        thread = self._thread_by_iid.get(iid)
+        if thread is not None:
+            self.selected_thread = thread
+            self._display_project(thread)
 
     # ── Display Helpers ──────────────────────────────────────────────
 
@@ -1189,7 +1307,14 @@ class GeminiAnalyzerApp:
                     f"  {msg.timestamp.strftime('%H:%M')}", "timestamp")
             self.msg_text.insert("end", "\n")
 
-            text = msg.text
+            if msg.attachments:
+                self.msg_text.insert(
+                    "end",
+                    f"  📎 attachments: {', '.join(msg.attachments)}\n",
+                    "timestamp",
+                )
+
+            text = msg.text or ""
             parts = re.split(r'(```\w*\n?[\s\S]*?```)', text)
 
             for part in parts:
@@ -1222,31 +1347,61 @@ class GeminiAnalyzerApp:
             f"From: {block.get('conversation_title', 'Unknown')[:50]}"
         )
 
-    def _display_project(self, name: str, convs: list[Conversation]) -> None:
+    def _display_project(self, thread: ProjectThread) -> None:
         self.proj_detail.configure(state="normal")
         self.proj_detail.delete("1.0", "end")
 
-        self.proj_detail.insert("end", f"{name}\n", "heading")
+        self.proj_detail.insert("end", f"{thread.name}\n", "heading")
 
-        total_blocks = 0
-        all_langs = set()
-        for conv in convs:
-            blocks = conv.all_code_blocks
-            total_blocks += len(blocks)
-            for b in blocks:
-                all_langs.add(b["language"])
+        span = f"{thread.span_days}d" if thread.span_days is not None else "unknown"
+        when = ""
+        if thread.first_activity and thread.last_activity:
+            when = f"  |  {thread.first_activity.date()} \u2192 {thread.last_activity.date()}"
+        self.proj_detail.insert(
+            "end",
+            f"{thread.size} fragments stitched  |  span {span}  |  "
+            f"{thread.code_block_count} code blocks  |  "
+            f"Languages: {', '.join(thread.languages) or 'none'}  |  "
+            f"merged by: {thread.merge_basis}{when}\n\n", "dim")
 
-        self.proj_detail.insert("end",
-            f"{len(convs)} conversations  |  "
-            f"{total_blocks} code blocks  |  "
-            f"Languages: {', '.join(sorted(all_langs)) or 'N/A'}\n\n", "dim")
+        # Show LLM summary if we already have one
+        summary = self._project_summaries.get(thread.name)
+        if summary:
+            self.proj_detail.insert("end", "AI summary\n", "subheading")
+            if summary.what_it_is:
+                self.proj_detail.insert("end", f"{summary.what_it_is}\n", "dim")
+            extras = []
+            if summary.status:
+                extras.append(f"Status: {summary.status}")
+            if summary.next_step:
+                extras.append(f"Next: {summary.next_step}")
+            if extras:
+                self.proj_detail.insert("end", "  ".join(extras) + "\n", "dim")
+            self.proj_detail.insert("end", "\n")
 
-        for conv in convs:
+        # Show full review if we have one
+        review = self._project_reviews.get(thread.name)
+        if review and review.markdown:
+            self.proj_detail.insert("end", "AI review\n", "subheading")
+            self.proj_detail.insert("end", review.markdown + "\n\n", "dim")
+
+        for conv in thread.conversations:
             date = ""
             if conv.create_time:
                 date = conv.create_time.strftime(" (%Y-%m-%d)")
             self.proj_detail.insert("end",
                 f"\u25B8 {conv.title[:60]}{date}\n", "subheading")
+
+            # Surface attachments (parsed today, hidden before Phase 4)
+            attach_names = [a for m in conv.messages for a in (m.attachments or [])]
+            if attach_names:
+                shown = ", ".join(attach_names[:6])
+                more = " \u2026" if len(attach_names) > 6 else ""
+                self.proj_detail.insert(
+                    "end",
+                    f"  \uD83D\uDCCE attachments: {shown}{more}\n",
+                    "dim",
+                )
 
             blocks = conv.all_code_blocks
             if blocks:
@@ -1365,8 +1520,14 @@ class GeminiAnalyzerApp:
             self._update_status(f"Export failed: {e}")
 
     def _get_selected_project_names(self) -> list[str]:
-        """Return the list of project names currently selected in proj_tree."""
-        return list(self.proj_tree.selection())
+        """Return the list of project keys (matching _project_data) currently
+        selected in proj_tree. Maps tree iids (e.g. 't0') back to display keys."""
+        out: list[str] = []
+        for iid in self.proj_tree.selection():
+            key = self._pdata_key_by_iid.get(iid)
+            if key is not None:
+                out.append(key)
+        return out
 
     def _collect_project_code(self, project_names: list[str]) -> dict[str, list[dict]]:
         """Collect all code blocks per project for the given project names."""
@@ -1636,6 +1797,155 @@ class GeminiAnalyzerApp:
         self.status_var.set(text)
         logger.info("Status: %s", text)
 
+    # ── LLM + bundle + dedup handlers (Phase 4) ──────────────────────
+
+    def _run_in_background(self, work, on_done, label: str) -> None:
+        """Run `work()` off the UI thread, then schedule `on_done(result, err)`
+        on it. Backend functions already fail soft; we still wrap so a bug here
+        can't freeze the UI, and we surface the error message to the callback
+        so the status line shows something actionable, not a generic 'failed'."""
+        self.proj_llm_status.set(label)
+
+        def _worker():
+            err = None
+            try:
+                result = work()
+            except Exception as e:
+                logger.error("%s failed: %s", label, e, exc_info=True)
+                result = None
+                err = str(e) or e.__class__.__name__
+            self.root.after(0, lambda: on_done(result, err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _llm_summarize_selected_project(self) -> None:
+        t = self.selected_thread
+        if t is None:
+            self._update_status("Select a project first.")
+            return
+        if not llm_is_available():
+            messagebox.showinfo(
+                "LLM not available",
+                f"Set the {LLM_ENV_KEY} environment variable, then restart the app.",
+            )
+            return
+
+        def work():
+            return summarize_project(t, self.llm_client, self.llm_cache)
+
+        def done(summary, err):
+            # Always cache the result on its project; only touch the visible
+            # status/detail if the same project is still selected, so a fast
+            # click-away doesn't stomp the new selection's UI.
+            still_selected = self.selected_thread is t
+            if summary is None:
+                if still_selected:
+                    detail = f": {err}" if err else " — check logs"
+                    self.proj_llm_status.set(f"Summarize failed{detail}")
+                self._update_status(f"LLM summarize failed for '{t.name}'.")
+                return
+            self._project_summaries[t.name] = summary
+            if still_selected:
+                self.proj_llm_status.set(f"Summary ready ({summary.model})")
+                self._display_project(t)
+
+        self._run_in_background(work, done, f"Summarizing '{t.name}' …")
+
+    def _llm_review_selected_project(self) -> None:
+        t = self.selected_thread
+        if t is None:
+            self._update_status("Select a project first.")
+            return
+        if not llm_is_available():
+            messagebox.showinfo(
+                "LLM not available",
+                f"Set the {LLM_ENV_KEY} environment variable, then restart the app.",
+            )
+            return
+
+        def work():
+            return review_project(t, self.llm_client, self.llm_cache)
+
+        def done(review, err):
+            still_selected = self.selected_thread is t
+            if review is None or not review.markdown:
+                if still_selected:
+                    detail = f": {err}" if err else " — check logs"
+                    self.proj_llm_status.set(f"Review failed{detail}")
+                self._update_status(f"LLM review failed for '{t.name}'.")
+                return
+            self._project_reviews[t.name] = review
+            if still_selected:
+                self.proj_llm_status.set(f"Review ready ({review.model})")
+                self._display_project(t)
+
+        self._run_in_background(work, done, f"Reviewing '{t.name}' …")
+
+    def _export_claude_bundle_single(self) -> None:
+        t = self.selected_thread
+        if t is None:
+            self._update_status("Select a project first.")
+            return
+        folder = filedialog.askdirectory(title="Choose folder for the Claude-ready bundle")
+        if not folder:
+            return
+        try:
+            path = write_project_bundle(
+                t, Path(folder),
+                summary=self._project_summaries.get(t.name),
+                review=self._project_reviews.get(t.name),
+            )
+        except (OSError, RuntimeError) as e:
+            logger.error("Bundle export failed: %s", e)
+            self._update_status(f"Bundle export failed: {e}")
+            return
+        self._update_status(f"Wrote Claude bundle: {path.name}")
+
+    def _export_claude_bundles_selected(self) -> None:
+        iids = list(self.proj_tree.selection())
+        threads = [self._thread_by_iid[i] for i in iids if i in self._thread_by_iid]
+        if not threads:
+            self._update_status("No projects selected.")
+            return
+        folder = filedialog.askdirectory(title="Choose folder for Claude-ready bundles")
+        if not folder:
+            return
+        out = Path(folder)
+        written = 0
+        for t in threads:
+            try:
+                write_project_bundle(
+                    t, out,
+                    summary=self._project_summaries.get(t.name),
+                    review=self._project_reviews.get(t.name),
+                )
+                written += 1
+            except (OSError, RuntimeError) as e:
+                logger.error("Skipping %s: %s", t.name, e)
+        self._update_status(
+            f"Wrote {written} Claude bundle{'s' if written != 1 else ''} to {out.name}/"
+        )
+
+    def _save_dedup_report(self) -> None:
+        if not self.conversations:
+            self._update_status("Load data first.")
+            return
+        folder = filedialog.askdirectory(title="Choose folder to save the dedup report")
+        if not folder:
+            return
+
+        def work():
+            return write_dedup_report(self.conversations, Path(folder))
+
+        def done(path, err):
+            if path is None:
+                detail = f": {err}" if err else " — check logs."
+                self._update_status(f"Dedup report failed{detail}")
+                return
+            self._update_status(f"Dedup report saved: {path.name} (source files untouched)")
+
+        self._run_in_background(work, done, "Scanning for duplicates …")
+
     def _on_close(self) -> None:
         try:
             self.config.set("window_width", self.root.winfo_width())
@@ -1643,6 +1953,7 @@ class GeminiAnalyzerApp:
             self.config.set("window_x", self.root.winfo_x())
             self.config.set("window_y", self.root.winfo_y())
             self.config.save()
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't let a save failure prevent shutdown — but make it visible.
+            logger.error("Window state save on close failed: %s", e, exc_info=True)
         self.root.destroy()
